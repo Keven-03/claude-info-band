@@ -1,20 +1,334 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Clock, Limit, Mode, Stats, Tokens, UpdateInfo } from '../types'
+import type { Clock, Lang, Limit, Mode, Prefs, Stats, Tokens, UpdateInfo } from '../types'
 
-// ---------- GitHub 更新检查 ----------
+// =====================================================================
+// 状态
+// =====================================================================
 
-const REPO = 'Keven-03/claude-info-band'
-const REMOTE_MANIFEST = `https://raw.githubusercontent.com/${REPO}/main/.claude-plugin/plugin.json`
-const CHECK_EVERY_MS = 6 * 60 * 60 * 1000 // 每 6 小时检查一次
-
+const stats = atom({ plugin: 'info-band', key: 'stats' } as const, {
+  turns: 0,
+  tools: 0,
+  lastSeconds: null,
+  lastTools: 0,
+} as Stats)
+const tokens = atom({ plugin: 'info-band', key: 'tokens' } as const, {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+} as Tokens)
+const clock = atom({ plugin: 'info-band', key: 'clock' } as const, {
+  turnStartedAt: null,
+  now: 0,
+} as Clock)
+const usd = atom({ plugin: 'info-band', key: 'usd' } as const, null as number | null)
+const limits = atom({ plugin: 'info-band', key: 'limits' } as const, [] as Limit[])
+const model = atom({ plugin: 'info-band', key: 'model' } as const, '')
+const mode = atom({ plugin: 'info-band', key: 'mode' } as const, 'compact' as Mode)
+// 默认英文，点信息条上的「中」可切换中文
+const prefs = atom({ plugin: 'info-band', key: 'prefs' } as const, {
+  lang: 'en',
+  tz: 'Asia/Singapore',
+} as Prefs)
 const updateInfo = atom({ plugin: 'info-band', key: 'update' } as const, {
   current: '',
   latest: null,
   status: 'idle',
   message: '',
 } as UpdateInfo)
+
+const PREFS_KEY = 'prefs' // $.store 里的键，跨会话保存
+
+// =====================================================================
+// 配色：与银雷夜色主题一致
+// =====================================================================
+
+const C = {
+  bolt: '#4fc3ff',
+  violet: '#a78bfa',
+  silver: '#eef2ff',
+  soft: '#c5cde8',
+  dim: '#7c87ad',
+  track: '#2a3352',
+  amber: '#ffc857',
+  red: '#ff5d7a',
+  green: '#5be3a8',
+}
+
+// =====================================================================
+// 中英文案
+// =====================================================================
+
+const T = {
+  zh: {
+    weekdays: ['星期日', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六'],
+    week: '周额',
+    fableWeek: 'Fable周',
+    session: '会话',
+    thisTurn: '本轮',
+    lastTurn: '上轮',
+    cacheHit: '缓存命中率',
+    read: '读',
+    write: '写',
+    input: '入',
+    output: '出',
+    turns: (n: number) => `${n} 轮`,
+    tools: (n: number) => `${n} 次工具`,
+    timezone: '时区',
+    upToDate: (v: string) => `v${v} · 已是最新版`,
+    newVersion: '有新版本',
+    current: '当前',
+    latest: '最新',
+    updateNow: '一键更新',
+    retry: '重试更新',
+    updating: '正在更新…',
+    updatedReloading: (v: string) => `已更新到 ${v}，正在重新加载…`,
+    updatedManual: (v: string) => `已更新到 ${v}，运行 /reload-plugins 或重开窗口生效`,
+    updateFailed: (why: string) => `更新失败：${why}`,
+    langButton: 'EN',
+    left: (d: number, h: number, m: number) =>
+      d > 0 ? `${d}天${h}时` : h > 0 ? `${h}时${m}分` : `${m}分`,
+  },
+  en: {
+    weekdays: ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'],
+    week: 'Week',
+    fableWeek: 'Fable wk',
+    session: 'Session',
+    thisTurn: 'Turn',
+    lastTurn: 'Last',
+    cacheHit: 'Cache hit',
+    read: 'read',
+    write: 'write',
+    input: 'in',
+    output: 'out',
+    turns: (n: number) => `${n} turn${n === 1 ? '' : 's'}`,
+    tools: (n: number) => `${n} tool call${n === 1 ? '' : 's'}`,
+    timezone: 'Time zone',
+    upToDate: (v: string) => `v${v} · up to date`,
+    newVersion: 'Update available',
+    current: 'current',
+    latest: 'latest',
+    updateNow: 'Update now',
+    retry: 'Retry update',
+    updating: 'Updating…',
+    updatedReloading: (v: string) => `Updated to ${v}, reloading…`,
+    updatedManual: (v: string) => `Updated to ${v}. Run /reload-plugins or reopen the window`,
+    updateFailed: (why: string) => `Update failed: ${why}`,
+    langButton: '中',
+    left: (d: number, h: number, m: number) =>
+      d > 0 ? `${d}d ${h}h` : h > 0 ? `${h}h ${m}m` : `${m}m`,
+  },
+} as const
+
+const MONTHS_EN = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December',
+]
+
+// =====================================================================
+// 时区
+// =====================================================================
+
+type Zone = {
+  id: string
+  zh: string
+  en: string
+  /** 不支持 Intl 时用的标准时差（分钟） */
+  fallbackOffset: number
+  /** 缩写：标准时 / 夏令时 */
+  abbr: [string, string]
+}
+
+const ZONES: Zone[] = [
+  { id: 'Asia/Singapore', zh: '新加坡', en: 'Singapore', fallbackOffset: 480, abbr: ['SGT', 'SGT'] },
+  { id: 'Asia/Shanghai', zh: '北京 / 上海', en: 'Beijing / Shanghai', fallbackOffset: 480, abbr: ['CST', 'CST'] },
+  { id: 'Asia/Hong_Kong', zh: '香港', en: 'Hong Kong', fallbackOffset: 480, abbr: ['HKT', 'HKT'] },
+  { id: 'Asia/Taipei', zh: '台北', en: 'Taipei', fallbackOffset: 480, abbr: ['TST', 'TST'] },
+  { id: 'Asia/Tokyo', zh: '东京', en: 'Tokyo', fallbackOffset: 540, abbr: ['JST', 'JST'] },
+  { id: 'Asia/Seoul', zh: '首尔', en: 'Seoul', fallbackOffset: 540, abbr: ['KST', 'KST'] },
+  { id: 'Asia/Kolkata', zh: '印度', en: 'India', fallbackOffset: 330, abbr: ['IST', 'IST'] },
+  { id: 'Asia/Dubai', zh: '迪拜', en: 'Dubai', fallbackOffset: 240, abbr: ['GST', 'GST'] },
+  { id: 'Europe/London', zh: '伦敦', en: 'London', fallbackOffset: 0, abbr: ['GMT', 'BST'] },
+  { id: 'Europe/Paris', zh: '巴黎 / 柏林', en: 'Paris / Berlin', fallbackOffset: 60, abbr: ['CET', 'CEST'] },
+  { id: 'America/New_York', zh: '美东（纽约）', en: 'US Eastern (New York)', fallbackOffset: -300, abbr: ['EST', 'EDT'] },
+  { id: 'America/Chicago', zh: '美中（芝加哥）', en: 'US Central (Chicago)', fallbackOffset: -360, abbr: ['CST', 'CDT'] },
+  { id: 'America/Denver', zh: '美山地（丹佛）', en: 'US Mountain (Denver)', fallbackOffset: -420, abbr: ['MST', 'MDT'] },
+  { id: 'America/Los_Angeles', zh: '美西（洛杉矶）', en: 'US Pacific (Los Angeles)', fallbackOffset: -480, abbr: ['PST', 'PDT'] },
+  { id: 'Australia/Sydney', zh: '悉尼', en: 'Sydney', fallbackOffset: 600, abbr: ['AEST', 'AEDT'] },
+  { id: 'UTC', zh: 'UTC', en: 'UTC', fallbackOffset: 0, abbr: ['UTC', 'UTC'] },
+  { id: 'local', zh: '跟随电脑', en: 'This computer', fallbackOffset: 0, abbr: ['', ''] },
+]
+
+function findZone(id: string): Zone {
+  return ZONES.find(z => z.id === id) ?? ZONES[0]
+}
+
+/** 某时区在某时刻相对 UTC 的分钟数；优先用 Intl（自动处理夏令时） */
+function offsetMinutes(zone: Zone, ms: number): number {
+  if (zone.id === 'local') return -new Date(ms).getTimezoneOffset()
+  try {
+    const fmt = new Intl.DateTimeFormat('en-US', {
+      timeZone: zone.id,
+      hourCycle: 'h23',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    })
+    const p: Record<string, number> = {}
+    for (const part of fmt.formatToParts(new Date(ms))) {
+      if (part.type !== 'literal') p[part.type] = parseInt(part.value, 10)
+    }
+    const asUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour % 24, p.minute, p.second)
+    return Math.round((asUtc - Math.floor(ms / 1000) * 1000) / 60000)
+  } catch {
+    return zone.fallbackOffset
+  }
+}
+
+function zoneAbbr(zone: Zone, offset: number): string {
+  if (zone.id === 'local') {
+    const sign = offset >= 0 ? '+' : '-'
+    const a = Math.abs(offset)
+    return `UTC${sign}${Math.floor(a / 60)}${a % 60 ? `:${String(a % 60).padStart(2, '0')}` : ''}`
+  }
+  return offset !== zone.fallbackOffset ? zone.abbr[1] : zone.abbr[0]
+}
+
+/** 返回该时区的“墙上时间”（用 UTC 读数）和缩写 */
+function zoned(ms: number, tz: string): { d: Date; abbr: string } {
+  const zone = findZone(tz)
+  const off = offsetMinutes(zone, ms)
+  return { d: new Date(ms + off * 60000), abbr: zoneAbbr(zone, off) }
+}
+
+function fmtDate(d: Date, lang: Lang): string {
+  const wd = T[lang].weekdays[d.getUTCDay()]
+  if (lang === 'zh') {
+    return `${d.getUTCFullYear()}年${d.getUTCMonth() + 1}月${d.getUTCDate()}日 ${wd}`
+  }
+  return `${wd}, ${MONTHS_EN[d.getUTCMonth()]} ${d.getUTCDate()}, ${d.getUTCFullYear()}`
+}
+
+/** 24 小时制，例：06:05:14 SGT */
+function fmtTime(d: Date, abbr: string): string {
+  const hh = String(d.getUTCHours()).padStart(2, '0')
+  const mm = String(d.getUTCMinutes()).padStart(2, '0')
+  const ss = String(d.getUTCSeconds()).padStart(2, '0')
+  return `${hh}:${mm}:${ss}${abbr ? ` ${abbr}` : ''}`
+}
+
+// =====================================================================
+// 其他格式化
+// =====================================================================
+
+function fmtClock(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000))
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const sec = s % 60
+  const mm = String(m).padStart(2, '0')
+  const ss = String(sec).padStart(2, '0')
+  return h > 0 ? `${h}:${mm}:${ss}` : `${m}:${ss}`
+}
+
+function fmtLeft(iso: string | undefined, now: number, lang: Lang): string {
+  if (!iso) return ''
+  const t = Date.parse(iso)
+  if (Number.isNaN(t)) return ''
+  const s = Math.max(0, Math.floor((t - now) / 1000))
+  return T[lang].left(Math.floor(s / 86400), Math.floor((s % 86400) / 3600), Math.floor((s % 3600) / 60))
+}
+
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`
+  if (n >= 10_000) return `${Math.round(n / 1000)}K`
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}K`
+  return String(n)
+}
+
+function usageColor(pct: number): string {
+  if (pct >= 80) return C.red
+  if (pct >= 50) return C.amber
+  return C.bolt
+}
+
+function hitColor(ratio: number): string {
+  if (ratio >= 0.8) return C.green
+  if (ratio >= 0.5) return C.amber
+  return C.red
+}
+
+/** 选出要显示的周额度：Fable 时优先 Fable 专属窗口，否则用全部模型的周额度 */
+function pickWeekly(all: Limit[], isFable: boolean, lang: Lang): { limit: Limit | null; label: string } {
+  const weekly = all.filter(l => /seven_day|week/i.test(l.kind))
+  if (isFable) {
+    const f = weekly.find(l => /fable/i.test(l.kind)) ?? all.find(l => /fable/i.test(l.kind))
+    if (f) return { limit: f, label: T[lang].fableWeek }
+  }
+  const generic =
+    all.find(l => l.kind === 'seven_day') ??
+    weekly.find(l => !/fable|opus|sonnet|haiku/i.test(l.kind)) ??
+    null
+  return { limit: generic, label: T[lang].week }
+}
+
+// =====================================================================
+// 会话数据、偏好
+// =====================================================================
+
+async function refreshSession($: EngineInterface) {
+  try {
+    const u = await $.session.usage()
+    await update($, usd, () => (u.cost ? u.cost.usd : null))
+    await update($, limits, () =>
+      u.rateLimits.map(r => ({ kind: r.kind, percentUsed: r.percentUsed, resetsAt: r.resetsAt })),
+    )
+  } catch {
+    // 拿不到时保持原值
+  }
+  try {
+    const m = await $.session.model()
+    await update($, model, () => m)
+  } catch {
+    // ignore
+  }
+}
+
+async function loadPrefs($: EngineInterface) {
+  try {
+    const saved = (await $.store.get(PREFS_KEY)) as Partial<Prefs> | undefined
+    if (saved && typeof saved === 'object') {
+      await update($, prefs, p => ({
+        lang: saved.lang === 'en' || saved.lang === 'zh' ? saved.lang : p.lang,
+        tz: typeof saved.tz === 'string' && ZONES.some(z => z.id === saved.tz) ? saved.tz : p.tz,
+      }))
+    }
+  } catch {
+    // 用默认值
+  }
+}
+
+async function setPrefs($: EngineInterface, change: Partial<Prefs>) {
+  await update($, prefs, p => ({ ...p, ...change }))
+  try {
+    await $.store.set(PREFS_KEY, await read($, prefs))
+  } catch {
+    // 保存失败也不影响本会话
+  }
+}
+
+// =====================================================================
+// GitHub 更新检查
+// =====================================================================
+
+const REPO = 'Keven-03/claude-info-band'
+const REMOTE_MANIFEST = `https://raw.githubusercontent.com/${REPO}/main/.claude-plugin/plugin.json`
+const CHECK_EVERY_MS = 60 * 1000 // 每 1 分钟检查一次
 
 /** a 比 b 新返回正数 */
 function compareVersions(a: string, b: string): number {
@@ -53,7 +367,6 @@ async function checkForUpdate($: EngineInterface) {
     ...u,
     current,
     latest,
-    // 正在更新或刚更新完时不覆盖状态
     status: u.status === 'updating' || u.status === 'done' ? u.status : 'idle',
   }))
 }
@@ -62,10 +375,9 @@ async function checkForUpdate($: EngineInterface) {
 async function runUpdate($: EngineInterface) {
   const info = await read($, updateInfo)
   if (info.status === 'updating') return
-  await update($, updateInfo, u => ({ ...u, status: 'updating', message: '正在更新…' }))
+  await update($, updateInfo, u => ({ ...u, status: 'updating', message: '' }))
 
   try {
-    // 找到这个插件是从哪个插件市场装的（例如 info-band@claude-info-band）
     const list = await $.process.run(['claude', 'plugin', 'list', '--json'], { timeoutMs: 60000 })
     const parsed = JSON.parse(list.stdout) as unknown
     const rows = (
@@ -91,168 +403,24 @@ async function runUpdate($: EngineInterface) {
       throw new Error(why || `exit ${up.exitCode}`)
     }
 
-    await update($, updateInfo, u => ({
-      ...u,
-      status: 'done',
-      message: `已更新到 ${u.latest ?? '最新版'}，正在重新加载…`,
-    }))
+    await update($, updateInfo, u => ({ ...u, status: 'done', message: 'reloading' }))
     try {
       await $.command.run({ command: 'reload-plugins' })
     } catch {
-      await update($, updateInfo, u => ({
-        ...u,
-        message: `已更新到 ${u.latest ?? '最新版'}，运行 /reload-plugins 或重开窗口生效`,
-      }))
+      await update($, updateInfo, u => ({ ...u, message: 'manual' }))
     }
   } catch (error) {
     await update($, updateInfo, u => ({
       ...u,
       status: 'error',
-      message: `更新失败：${String(error instanceof Error ? error.message : error).slice(0, 120)}`,
+      message: String(error instanceof Error ? error.message : error).slice(0, 120),
     }))
   }
 }
 
-const stats = atom({ plugin: 'info-band', key: 'stats' } as const, {
-  turns: 0,
-  tools: 0,
-  lastSeconds: null,
-  lastTools: 0,
-} as Stats)
-const tokens = atom({ plugin: 'info-band', key: 'tokens' } as const, {
-  input: 0,
-  output: 0,
-  cacheRead: 0,
-  cacheWrite: 0,
-} as Tokens)
-const clock = atom({ plugin: 'info-band', key: 'clock' } as const, {
-  turnStartedAt: null,
-  now: 0,
-} as Clock)
-const usd = atom({ plugin: 'info-band', key: 'usd' } as const, null as number | null)
-const limits = atom({ plugin: 'info-band', key: 'limits' } as const, [] as Limit[])
-const model = atom({ plugin: 'info-band', key: 'model' } as const, '')
-const mode = atom({ plugin: 'info-band', key: 'mode' } as const, 'compact' as Mode)
-
-// ---------- 配色：与银雷夜色主题一致 ----------
-
-const C = {
-  bolt: '#4fc3ff',
-  violet: '#a78bfa',
-  silver: '#eef2ff',
-  soft: '#c5cde8',
-  dim: '#7c87ad',
-  track: '#2a3352',
-  amber: '#ffc857',
-  red: '#ff5d7a',
-  green: '#5be3a8',
-}
-
-// ---------- 美式日期时间 ----------
-
-const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
-const MONTHS = [
-  'January', 'February', 'March', 'April', 'May', 'June',
-  'July', 'August', 'September', 'October', 'November', 'December',
-]
-
-// 新加坡时间 = UTC+8，全年无夏令时：把时间戳加 8 小时后用 UTC 读数，不受电脑时区影响
-const SGT_OFFSET_MS = 8 * 60 * 60 * 1000
-
-function toSgt(ms: number): Date {
-  return new Date(ms + SGT_OFFSET_MS)
-}
-
-/** 例：Monday, November 23, 2026（传入 toSgt 之后的时间） */
-function usDate(d: Date): string {
-  return `${WEEKDAYS[d.getUTCDay()]}, ${MONTHS[d.getUTCMonth()]} ${d.getUTCDate()}, ${d.getUTCFullYear()}`
-}
-
-/** 例：06:05:14 SGT，24 小时制（传入 toSgt 之后的时间） */
-function usTime(d: Date): string {
-  const hh = String(d.getUTCHours()).padStart(2, '0')
-  const mm = String(d.getUTCMinutes()).padStart(2, '0')
-  const ss = String(d.getUTCSeconds()).padStart(2, '0')
-  return `${hh}:${mm}:${ss} SGT`
-}
-
-// ---------- 其他格式化 ----------
-
-function fmtClock(ms: number): string {
-  const s = Math.max(0, Math.floor(ms / 1000))
-  const h = Math.floor(s / 3600)
-  const m = Math.floor((s % 3600) / 60)
-  const sec = s % 60
-  const mm = String(m).padStart(2, '0')
-  const ss = String(sec).padStart(2, '0')
-  return h > 0 ? `${h}:${mm}:${ss}` : `${m}:${ss}`
-}
-
-function fmtLeft(iso: string | undefined, now: number): string {
-  if (!iso) return ''
-  const t = Date.parse(iso)
-  if (Number.isNaN(t)) return ''
-  const s = Math.max(0, Math.floor((t - now) / 1000))
-  const d = Math.floor(s / 86400)
-  const h = Math.floor((s % 86400) / 3600)
-  const m = Math.floor((s % 3600) / 60)
-  if (d > 0) return `${d}天${h}时`
-  if (h > 0) return `${h}时${m}分`
-  return `${m}分`
-}
-
-function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`
-  if (n >= 10_000) return `${Math.round(n / 1000)}K`
-  if (n >= 1000) return `${(n / 1000).toFixed(1)}K`
-  return String(n)
-}
-
-function usageColor(pct: number): string {
-  if (pct >= 80) return C.red
-  if (pct >= 50) return C.amber
-  return C.bolt
-}
-
-function hitColor(ratio: number): string {
-  if (ratio >= 0.8) return C.green
-  if (ratio >= 0.5) return C.amber
-  return C.red
-}
-
-/** 选出要显示的周额度：Fable 时优先 Fable 专属窗口，否则用全部模型的周额度 */
-function pickWeekly(all: Limit[], isFable: boolean): { limit: Limit | null; label: string } {
-  const weekly = all.filter(l => /seven_day|week/i.test(l.kind))
-  if (isFable) {
-    const f = weekly.find(l => /fable/i.test(l.kind)) ?? all.find(l => /fable/i.test(l.kind))
-    if (f) return { limit: f, label: 'Fable周' }
-  }
-  const generic =
-    all.find(l => l.kind === 'seven_day') ??
-    weekly.find(l => !/fable|opus|sonnet|haiku/i.test(l.kind)) ??
-    null
-  return { limit: generic, label: '周额' }
-}
-
-async function refreshSession($: EngineInterface) {
-  try {
-    const u = await $.session.usage()
-    await update($, usd, () => (u.cost ? u.cost.usd : null))
-    await update($, limits, () =>
-      u.rateLimits.map(r => ({ kind: r.kind, percentUsed: r.percentUsed, resetsAt: r.resetsAt })),
-    )
-  } catch {
-    // 拿不到时保持原值
-  }
-  try {
-    const m = await $.session.model()
-    await update($, model, () => m)
-  } catch {
-    // ignore
-  }
-}
-
-// ---------- 钩子 ----------
+// =====================================================================
+// 钩子
+// =====================================================================
 
 export const register: Register = on => {
   let turnTools = 0
@@ -265,15 +433,16 @@ export const register: Register = on => {
     } catch {
       sessionStartedAt = await $.clock.now()
     }
+    await loadPrefs($)
     await refreshSession($)
 
-    // 更新检查：启动时一次，之后每 6 小时一次
+    // 更新检查：启动时一次，之后每 1 分钟一次
     void checkForUpdate($)
     $.clock.every(CHECK_EVERY_MS, () => {
       void checkForUpdate($)
     })
 
-    // 每秒刷新一次（顶部时钟精确到秒）；空闲时每 20 秒顺带更新模型和额度
+    // 每秒刷新一次（时钟精确到秒）；空闲时每 20 秒顺带更新模型和额度
     let ticks = 0
     $.clock.every(1000, () => {
       void (async () => {
@@ -332,12 +501,12 @@ export const register: Register = on => {
     return r
   })
 
-  // ---------- 输入框上方：时间 + 会话信息 ----------
+  // ---------- 输入框上方的信息条 ----------
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
 
-    const { Box, Button, Text } = $.ui.resolve(e)
+    const { Box, Button, Text, Select } = $.ui.resolve(e)
     const m = await read($, mode)
     const setMode = (v: Mode) => update($, mode, () => v)
 
@@ -349,22 +518,25 @@ export const register: Register = on => {
       )
     }
 
+    const p = await read($, prefs)
+    const L = T[p.lang]
     const s = await read($, stats)
     const t = await read($, tokens)
     const c = await read($, clock)
     const cost = await read($, usd)
     const lims = await read($, limits)
     const modelName = await read($, model)
+    const up = await read($, updateInfo)
 
     const now = c.now || (await $.clock.now())
-    const date = toSgt(now)
+    const z = zoned(now, p.tz)
     const running = c.turnStartedAt !== null
     const sessionMs = sessionStartedAt === null ? 0 : now - sessionStartedAt
     const total = t.input + t.cacheRead + t.cacheWrite + t.output
 
     const isFable = /fable/i.test(modelName)
     const five = lims.find(l => l.kind === 'five_hour') ?? null
-    const week = pickWeekly(lims, isFable)
+    const week = pickWeekly(lims, isFable, p.lang)
 
     const sep = () => <Text color={C.track}>  ·  </Text>
     const meter = (pct: number, cells = 6) => {
@@ -391,22 +563,69 @@ export const register: Register = on => {
             {Math.round(l.percentUsed)}%
           </Text>
           {l.resetsAt ? (
-            <Text color={C.dim} size="caption"> ↻{fmtLeft(l.resetsAt, now)}</Text>
+            <Text color={C.dim} size="caption"> ↻{fmtLeft(l.resetsAt, now, p.lang)}</Text>
           ) : (
             <Text> </Text>
           )}
         </Text>
       )
 
-    // 第一行：美式日期时间
+    // 更新提示行
+    const hasNew = up.latest !== null && up.current !== '' && compareVersions(up.latest, up.current) > 0
+    const updateMsg =
+      up.status === 'updating'
+        ? L.updating
+        : up.status === 'done'
+          ? up.message === 'manual'
+            ? L.updatedManual(up.latest ?? '')
+            : L.updatedReloading(up.latest ?? '')
+          : up.status === 'error'
+            ? L.updateFailed(up.message)
+            : ''
+    const updateRow =
+      hasNew || up.status !== 'idle' ? (
+        <Box flexDirection="row" alignItems="center" paddingX={1}>
+          <Box flexDirection="row" flexGrow={1}>
+            <Text color={C.amber} weight="semibold">{L.newVersion}</Text>
+            <Text color={C.dim}>  {L.current} </Text>
+            <Text color={C.soft} tabular>v{up.current || '?'}</Text>
+            <Text color={C.dim}>  →  {L.latest} </Text>
+            <Text color={C.green} weight="semibold" tabular>v{up.latest ?? '?'}</Text>
+            {updateMsg ? (
+              <Text color={up.status === 'error' ? C.red : C.dim} size="caption">
+                {'   '}
+                {updateMsg}
+              </Text>
+            ) : (
+              <Text> </Text>
+            )}
+          </Box>
+          {up.status === 'updating' || up.status === 'done' ? (
+            <Text> </Text>
+          ) : (
+            <Button
+              key="update"
+              label={up.status === 'error' ? L.retry : L.updateNow}
+              onPress={() => runUpdate($)}
+            />
+          )}
+        </Box>
+      ) : null
+
+    // 第一行：日期时间 + 语言切换 + 展开/收起
     const timeRow = (
       <Box flexDirection="row" alignItems="center" paddingX={1}>
         <Box flexDirection="row" flexGrow={1}>
-          <Text color={C.silver} weight="semibold">{usDate(date)}</Text>
+          <Text color={C.silver} weight="semibold">{fmtDate(z.d, p.lang)}</Text>
           <Text color={C.track}>  │  </Text>
-          <Text color={C.bolt} weight="semibold" tabular>{usTime(date)}</Text>
+          <Text color={C.bolt} weight="semibold" tabular>{fmtTime(z.d, z.abbr)}</Text>
         </Box>
         <Box flexDirection="row" gap={1}>
+          <Button
+            key="lang"
+            label={L.langButton}
+            onPress={() => setPrefs($, { lang: p.lang === 'zh' ? 'en' : 'zh' })}
+          />
           <Button
             key="toggle"
             label={m === 'detail' ? '▴' : '▾'}
@@ -425,12 +644,12 @@ export const register: Register = on => {
         {quota(week.label, week.limit)}
         {sep()}
         <Text>
-          <Text color={C.dim} size="caption">会话 </Text>
+          <Text color={C.dim} size="caption">{L.session} </Text>
           <Text color={C.soft} tabular weight="semibold">{fmtClock(sessionMs)}</Text>
         </Text>
         {sep()}
         <Text>
-          <Text color={C.dim} size="caption">{running ? '本轮 ' : '上轮 '}</Text>
+          <Text color={C.dim} size="caption">{running ? L.thisTurn : L.lastTurn} </Text>
           <Text color={running ? C.amber : C.soft} tabular weight="semibold">
             {running
               ? fmtClock(now - (c.turnStartedAt as number))
@@ -455,7 +674,7 @@ export const register: Register = on => {
       </Box>
     )
 
-    // 最下面一行：缓存命中率
+    // 第三行：缓存命中率
     const promptTotal = t.input + t.cacheRead + t.cacheWrite
     const hit = promptTotal > 0 ? t.cacheRead / promptTotal : null
     const hitCells = 12
@@ -464,7 +683,7 @@ export const register: Register = on => {
     const cacheRow = (
       <Box flexDirection="row" paddingX={1}>
         <Text>
-          <Text color={C.dim} size="caption">缓存命中率 </Text>
+          <Text color={C.dim} size="caption">{L.cacheHit} </Text>
           <Text color={hitCol}>{'━'.repeat(hitN)}</Text>
           <Text color={C.track}>{'━'.repeat(hitCells - hitN)}</Text>
           <Text color={hitCol} weight="semibold" tabular>
@@ -472,44 +691,12 @@ export const register: Register = on => {
             {hit === null ? '—' : `${(hit * 100).toFixed(1)}%`}
           </Text>
           <Text color={C.dim} size="caption">
-            {'   '}读 {fmtTokens(t.cacheRead)} · 写 {fmtTokens(t.cacheWrite)}
+            {'   '}
+            {L.read} {fmtTokens(t.cacheRead)} · {L.write} {fmtTokens(t.cacheWrite)}
           </Text>
         </Text>
       </Box>
     )
-
-    // 有新版本时最上面多一行提示和一键更新按钮
-    const up = await read($, updateInfo)
-    const hasNew = up.latest !== null && up.current !== '' && compareVersions(up.latest, up.current) > 0
-    const showUpdate = hasNew || up.status !== 'idle'
-    const updateRow = showUpdate ? (
-      <Box flexDirection="row" alignItems="center" paddingX={1}>
-        <Box flexDirection="row" flexGrow={1}>
-          <Text color={C.amber} weight="semibold">有新版本</Text>
-          <Text color={C.dim}>  当前 </Text>
-          <Text color={C.soft} tabular>v{up.current || '?'}</Text>
-          <Text color={C.dim}>  →  最新 </Text>
-          <Text color={C.green} weight="semibold" tabular>v{up.latest ?? '?'}</Text>
-          {up.message ? (
-            <Text color={up.status === 'error' ? C.red : C.dim} size="caption">
-              {'   '}
-              {up.message}
-            </Text>
-          ) : (
-            <Text> </Text>
-          )}
-        </Box>
-        {up.status === 'updating' || up.status === 'done' ? (
-          <Text> </Text>
-        ) : (
-          <Button
-            key="update"
-            label={up.status === 'error' ? '重试更新' : '一键更新'}
-            onPress={() => runUpdate($)}
-          />
-        )}
-      </Box>
-    ) : null
 
     if (m !== 'detail') {
       if (updateRow === null) {
@@ -531,34 +718,45 @@ export const register: Register = on => {
       )
     }
 
+    // 展开：多一行明细，和时区选择
     return (
       <Box flexDirection="column">
-        {updateRow ?? <Text color={C.dim} size="caption">  v{up.current} · 已是最新版</Text>}
+        {updateRow ?? <Text color={C.dim} size="caption">  {L.upToDate(up.current)}</Text>}
         {timeRow}
         {infoRow}
         {cacheRow}
         <Box flexDirection="row" flexWrap="wrap" paddingX={1}>
           <Text color={C.dim} size="caption">
-            {modelName ? `${modelName}  ·  ` : ''}入 {fmtTokens(t.input)}  出 {fmtTokens(t.output)}
-            {'  ·  '}{s.turns} 轮 {s.tools} 次工具
+            {modelName ? `${modelName}  ·  ` : ''}
+            {L.input} {fmtTokens(t.input)}  {L.output} {fmtTokens(t.output)}
+            {'  ·  '}
+            {L.turns(s.turns)} {L.tools(s.tools)}
           </Text>
+        </Box>
+        <Box flexDirection="row" alignItems="center" paddingX={1} gap={1}>
+          <Text color={C.dim} size="caption">{L.timezone}</Text>
+          <Select
+            key="tz"
+            options={ZONES.map(zz => ({ value: zz.id, label: p.lang === 'zh' ? zz.zh : zz.en }))}
+            value={p.tz}
+            onSelect={value => {
+              void setPrefs($, { tz: value })
+            }}
+          />
         </Box>
       </Box>
     )
   })
 
-  // ---------- 输入框下方：缓存命中率 ----------
+  // ---------- 终端：输入框下方提示行末尾追加缓存命中率 ----------
 
   on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
+    if (e.surface !== 'terminal') return next(e)
+    const p = await read($, prefs)
     const t = await read($, tokens)
     const promptTotal = t.input + t.cacheRead + t.cacheWrite
     const hit = promptTotal > 0 ? t.cacheRead / promptTotal : null
-    const text = hit === null ? '缓存命中率 —' : `缓存命中率 ${(hit * 100).toFixed(1)}%`
-
-    // 只有终端会画这行的追加文字；桌面端的命中率在信息条最下面一行
-    if (e.surface === 'terminal') {
-      return next({ ...e, props: { ...e.props, tail: `  ·  ${text}` } })
-    }
-    return next(e)
+    const text = `${T[p.lang].cacheHit} ${hit === null ? '—' : `${(hit * 100).toFixed(1)}%`}`
+    return next({ ...e, props: { ...e.props, tail: `  ·  ${text}` } })
   })
 }

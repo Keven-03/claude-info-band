@@ -32,9 +32,15 @@ export type UpdateInfo = {
   message: string
 }
 
+export type Lang = 'zh' | 'en'
+
+/** 用户偏好：界面语言和时区（IANA 名称，或 'local' 表示跟随电脑） */
+export type Prefs = { lang: Lang; tz: string }
+
 declare module 'claude-code' {
   interface PluginState {
     'info-band': {
+      prefs: Prefs
       update: UpdateInfo
       stats: Stats
       tokens: Tokens

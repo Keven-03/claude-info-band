@@ -1,6 +1,7 @@
 {
   "name": "info-band",
-  "version": "1.0.0",
-  "description": "输入框上方显示新加坡时间（美式格式）、额度、会话信息和缓存命中率，支持 GitHub 更新提醒与一键更新",
+  "version": "1.1.0",
+  "description": "Info band above the Claude Code prompt: clock with selectable time zone, usage limits, session stats and cache hit rate, in English or Chinese, with update check. 输入框上方的信息条：可选时区的时钟、额度、会话统计、缓存命中率，中英切换，支持更新提醒。",
+  "license": "MIT",
   "types": "./types/index.d.ts"
 }
