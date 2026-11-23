@@ -34,6 +34,57 @@ test('afternoon and midnight use 24-hour time', async ($, on) => {
   await ui.unmount()
 })
 
+test('a newer GitHub version shows the update row, and one click updates', async ($, on) => {
+  on('clock.now', () => ({ value: FIXED_NOW }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.usage', () => ({ value: { startedAt: FIXED_NOW, context: {}, rateLimits: [] } }))
+  on('session.model', () => ({ value: 'claude-opus-5-5' }))
+  on('clock.every', () => ({ value: {} }))
+  on('fs.read', () => ({ value: JSON.stringify({ name: 'info-band', version: '1.0.0' }) }))
+  on('http.fetch', () => ({
+    value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ version: '1.1.0' }) },
+  }))
+  const ran: string[] = []
+  on('process.run', (_, e) => {
+    const argv = (e as { argv: string[] }).argv
+    ran.push(argv.join(' '))
+    const stdout = argv.includes('list')
+      ? JSON.stringify([{ id: 'info-band@claude-info-band' }])
+      : 'ok'
+    return { value: { exitCode: 0, stdout, stderr: '' } }
+  })
+  on('command.run', () => ({ text: '' }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' } as never)
+  expect(await ui.find({ type: 'Text', text: /有新版本/ })).toBeDefined()
+  expect((await ui.find({ type: 'Text', text: /^v1\.0\.0$/ }))?.text).toBe('v1.0.0')
+  expect((await ui.find({ type: 'Text', text: /^v1\.1\.0$/ }))?.text).toBe('v1.1.0')
+
+  await ui.press({ key: 'update' })
+  expect(ran).toContain('claude plugin marketplace update claude-info-band')
+  expect(ran).toContain('claude plugin update info-band@claude-info-band --yes')
+  expect(await ui.find({ type: 'Text', text: /已更新到 1\.1\.0/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('no update row when already on the latest version', async ($, on) => {
+  on('clock.now', () => ({ value: FIXED_NOW }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.usage', () => ({ value: { startedAt: FIXED_NOW, context: {}, rateLimits: [] } }))
+  on('session.model', () => ({ value: 'claude-opus-5-5' }))
+  on('clock.every', () => ({ value: {} }))
+  on('fs.read', () => ({ value: JSON.stringify({ version: '1.0.0' }) }))
+  on('http.fetch', () => ({
+    value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ version: '1.0.0' }) },
+  }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' } as never)
+  expect(await ui.find({ type: 'Text', text: /有新版本/ })).toBeUndefined()
+  await ui.unmount()
+})
+
 test('band bottom row shows the cache hit rate on every surface', async ($, on) => {
   on('clock.now', () => ({ value: FIXED_NOW }))
   for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {

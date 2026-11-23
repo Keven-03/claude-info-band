@@ -24,9 +24,18 @@ export type Limit = { kind: string; percentUsed: number; resetsAt?: string }
 /** compact：一行；detail：两行；hidden：只留一个小按钮 */
 export type Mode = 'compact' | 'detail' | 'hidden'
 
+/** GitHub 更新检查的状态 */
+export type UpdateInfo = {
+  current: string
+  latest: string | null
+  status: 'idle' | 'updating' | 'done' | 'error'
+  message: string
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'info-band': {
+      update: UpdateInfo
       stats: Stats
       tokens: Tokens
       clock: Clock

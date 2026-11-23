@@ -1,7 +1,117 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Clock, Limit, Mode, Stats, Tokens } from '../types'
+import type { Clock, Limit, Mode, Stats, Tokens, UpdateInfo } from '../types'
+
+// ---------- GitHub 更新检查 ----------
+
+const REPO = 'Keven-03/claude-info-band'
+const REMOTE_MANIFEST = `https://raw.githubusercontent.com/${REPO}/main/.claude-plugin/plugin.json`
+const CHECK_EVERY_MS = 6 * 60 * 60 * 1000 // 每 6 小时检查一次
+
+const updateInfo = atom({ plugin: 'info-band', key: 'update' } as const, {
+  current: '',
+  latest: null,
+  status: 'idle',
+  message: '',
+} as UpdateInfo)
+
+/** a 比 b 新返回正数 */
+function compareVersions(a: string, b: string): number {
+  const pa = a.split(/[.+-]/).map(x => parseInt(x, 10) || 0)
+  const pb = b.split(/[.+-]/).map(x => parseInt(x, 10) || 0)
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0)
+    if (d !== 0) return d
+  }
+  return 0
+}
+
+async function readLocalVersion($: EngineInterface): Promise<string> {
+  try {
+    const raw = await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`)
+    const v = (JSON.parse(String(raw)) as { version?: unknown }).version
+    return typeof v === 'string' ? v : ''
+  } catch {
+    return ''
+  }
+}
+
+async function checkForUpdate($: EngineInterface) {
+  const current = await readLocalVersion($)
+  let latest: string | null = null
+  try {
+    const r = await $.http.fetch(`${REMOTE_MANIFEST}?t=${await $.clock.now()}`)
+    if (r.ok) {
+      const v = (JSON.parse(r.text) as { version?: unknown }).version
+      if (typeof v === 'string') latest = v
+    }
+  } catch {
+    // 网络不通时不提示
+  }
+  await update($, updateInfo, u => ({
+    ...u,
+    current,
+    latest,
+    // 正在更新或刚更新完时不覆盖状态
+    status: u.status === 'updating' || u.status === 'done' ? u.status : 'idle',
+  }))
+}
+
+/** 一键更新：刷新插件市场 → 更新插件 → 重新加载插件 */
+async function runUpdate($: EngineInterface) {
+  const info = await read($, updateInfo)
+  if (info.status === 'updating') return
+  await update($, updateInfo, u => ({ ...u, status: 'updating', message: '正在更新…' }))
+
+  try {
+    // 找到这个插件是从哪个插件市场装的（例如 info-band@claude-info-band）
+    const list = await $.process.run(['claude', 'plugin', 'list', '--json'], { timeoutMs: 60000 })
+    const parsed = JSON.parse(list.stdout) as unknown
+    const rows = (
+      Array.isArray(parsed)
+        ? parsed
+        : Array.isArray((parsed as { value?: unknown })?.value)
+          ? (parsed as { value: unknown[] }).value
+          : []
+    ) as { id?: string }[]
+    const id = rows.map(r => r.id ?? '').find(x => x.startsWith('info-band@')) ?? 'info-band'
+    const marketplace = id.includes('@') ? id.slice(id.indexOf('@') + 1) : null
+
+    if (marketplace) {
+      await $.process.run(['claude', 'plugin', 'marketplace', 'update', marketplace], {
+        timeoutMs: 120000,
+      })
+    }
+    const up = await $.process.run(['claude', 'plugin', 'update', id, '--yes'], {
+      timeoutMs: 180000,
+    })
+    if (up.exitCode !== 0) {
+      const why = (up.stderr || up.stdout).trim().split('\n').pop() ?? ''
+      throw new Error(why || `exit ${up.exitCode}`)
+    }
+
+    await update($, updateInfo, u => ({
+      ...u,
+      status: 'done',
+      message: `已更新到 ${u.latest ?? '最新版'}，正在重新加载…`,
+    }))
+    try {
+      await $.command.run({ command: 'reload-plugins' })
+    } catch {
+      await update($, updateInfo, u => ({
+        ...u,
+        message: `已更新到 ${u.latest ?? '最新版'}，运行 /reload-plugins 或重开窗口生效`,
+      }))
+    }
+  } catch (error) {
+    await update($, updateInfo, u => ({
+      ...u,
+      status: 'error',
+      message: `更新失败：${String(error instanceof Error ? error.message : error).slice(0, 120)}`,
+    }))
+  }
+}
 
 const stats = atom({ plugin: 'info-band', key: 'stats' } as const, {
   turns: 0,
@@ -156,6 +266,12 @@ export const register: Register = on => {
       sessionStartedAt = await $.clock.now()
     }
     await refreshSession($)
+
+    // 更新检查：启动时一次，之后每 6 小时一次
+    void checkForUpdate($)
+    $.clock.every(CHECK_EVERY_MS, () => {
+      void checkForUpdate($)
+    })
 
     // 每秒刷新一次（顶部时钟精确到秒）；空闲时每 20 秒顺带更新模型和额度
     let ticks = 0
@@ -362,9 +478,52 @@ export const register: Register = on => {
       </Box>
     )
 
+    // 有新版本时最上面多一行提示和一键更新按钮
+    const up = await read($, updateInfo)
+    const hasNew = up.latest !== null && up.current !== '' && compareVersions(up.latest, up.current) > 0
+    const showUpdate = hasNew || up.status !== 'idle'
+    const updateRow = showUpdate ? (
+      <Box flexDirection="row" alignItems="center" paddingX={1}>
+        <Box flexDirection="row" flexGrow={1}>
+          <Text color={C.amber} weight="semibold">有新版本</Text>
+          <Text color={C.dim}>  当前 </Text>
+          <Text color={C.soft} tabular>v{up.current || '?'}</Text>
+          <Text color={C.dim}>  →  最新 </Text>
+          <Text color={C.green} weight="semibold" tabular>v{up.latest ?? '?'}</Text>
+          {up.message ? (
+            <Text color={up.status === 'error' ? C.red : C.dim} size="caption">
+              {'   '}
+              {up.message}
+            </Text>
+          ) : (
+            <Text> </Text>
+          )}
+        </Box>
+        {up.status === 'updating' || up.status === 'done' ? (
+          <Text> </Text>
+        ) : (
+          <Button
+            key="update"
+            label={up.status === 'error' ? '重试更新' : '一键更新'}
+            onPress={() => runUpdate($)}
+          />
+        )}
+      </Box>
+    ) : null
+
     if (m !== 'detail') {
+      if (updateRow === null) {
+        return (
+          <Box flexDirection="column">
+            {timeRow}
+            {infoRow}
+            {cacheRow}
+          </Box>
+        )
+      }
       return (
         <Box flexDirection="column">
+          {updateRow}
           {timeRow}
           {infoRow}
           {cacheRow}
@@ -374,6 +533,7 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
+        {updateRow ?? <Text color={C.dim} size="caption">  v{up.current} · 已是最新版</Text>}
         {timeRow}
         {infoRow}
         {cacheRow}
