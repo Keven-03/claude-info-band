@@ -1,0 +1,6 @@
+{
+  "name": "info-band",
+  "version": "0.2.0",
+  "description": "输入框上方显示新加坡时间（美式格式）、额度与会话信息，下方显示缓存命中率",
+  "types": "./types/index.d.ts"
+}
